@@ -1,10 +1,30 @@
-use crate::api::Api;
-use anyhow::{Context, Result, bail};
+use crate::api::{Api, ApiError};
 use futures::{StreamExt, TryStreamExt, stream};
 use graphql_query_macro::validate_given_graphql;
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::BTreeMap;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum DiscoveryError {
+    #[error(transparent)]
+    Api(#[from] ApiError),
+    #[error("discovering repositories for {login}: {source}")]
+    OrganizationRepositories { login: String, source: ApiError },
+    #[error("paginated connection has no endCursor")]
+    MissingEndCursor,
+    #[error("GitHub returned a non-advancing pagination cursor: {cursor}")]
+    NonAdvancingCursor { cursor: String },
+    #[error("organization {login} became unavailable during discovery")]
+    OrganizationUnavailable { login: String },
+    #[error("null repository in discovery response")]
+    NullRepository,
+    #[error("null organization in discovery response")]
+    NullOrganization,
+}
+
+type Result<T> = std::result::Result<T, DiscoveryError>;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -57,11 +77,9 @@ fn advance(page: PageInfo, previous: &Option<String>) -> Result<Option<String>> 
     if !page.has_next_page {
         return Ok(None);
     }
-    let next = page
-        .end_cursor
-        .context("paginated connection has no endCursor")?;
+    let next = page.end_cursor.ok_or(DiscoveryError::MissingEndCursor)?;
     if previous.as_ref() == Some(&next) {
-        bail!("GitHub returned a non-advancing pagination cursor");
+        return Err(DiscoveryError::NonAdvancingCursor { cursor: next });
     }
     Ok(Some(next))
 }
@@ -74,16 +92,21 @@ async fn repositories(api: &Api, org: Option<&str>) -> Result<Vec<Repository>> {
             let data: OrgRepos = api
                 .strict(ORG_REPOS, json!({"login":login,"cursor":cursor}))
                 .await
-                .with_context(|| format!("discovering repositories for {login}"))?;
+                .map_err(|source| DiscoveryError::OrganizationRepositories {
+                    login: login.to_owned(),
+                    source,
+                })?;
             data.organization
-                .context("organization became unavailable during discovery")?
+                .ok_or_else(|| DiscoveryError::OrganizationUnavailable {
+                    login: login.to_owned(),
+                })?
                 .repositories
         } else {
             let data: UserRepos = api.strict(USER_REPOS, json!({"cursor":cursor})).await?;
             data.viewer.repositories
         };
         for node in connection.nodes {
-            repos.push(node.context("null repository in discovery response")?);
+            repos.push(node.ok_or(DiscoveryError::NullRepository)?);
         }
         cursor = advance(connection.page_info, &cursor)?;
         if cursor.is_none() {
@@ -109,10 +132,7 @@ pub async fn discover(api: &Api, concurrency: usize) -> Result<Vec<Repository>> 
     loop {
         let data: Orgs = api.strict(ORGS, json!({"cursor":cursor})).await?;
         for node in data.viewer.organizations.nodes {
-            organizations.push(
-                node.context("null organization in discovery response")?
-                    .login,
-            );
+            organizations.push(node.ok_or(DiscoveryError::NullOrganization)?.login);
         }
         cursor = advance(data.viewer.organizations.page_info, &cursor)?;
         if cursor.is_none() {
@@ -140,25 +160,19 @@ mod tests {
     }
     #[test]
     fn pagination_requires_progress() {
-        assert!(
+        assert!(matches!(
             advance(
                 PageInfo {
                     has_next_page: true,
                     end_cursor: None
                 },
                 &None
-            )
-            .is_err()
-        );
+            ),
+            Err(DiscoveryError::MissingEndCursor)
+        ));
         assert!(
-            advance(
-                PageInfo {
-                    has_next_page: true,
-                    end_cursor: Some("x".into())
-                },
-                &Some("x".into())
-            )
-            .is_err()
+            matches!(advance(PageInfo { has_next_page: true, end_cursor: Some("x".into()) }, &Some("x".into())),
+            Err(DiscoveryError::NonAdvancingCursor { cursor }) if cursor == "x")
         );
         assert_eq!(
             advance(

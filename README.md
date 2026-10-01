@@ -80,6 +80,9 @@ objects. Inspection also uses bounded concurrency. Discovery/API/inspection/outp
 live in separate small modules; alias responses use a map of typed values. Clap derive handles CLI parsing. The
 HTTP client is `ureq`; its blocking request and response I/O runs on Tokio's
 blocking pool, with the same bounded request concurrency and async retry delays.
+Errors use `thiserror` enums for API, discovery, inspection, and output failures;
+repository skips have typed reasons. Tests assert variants and retained diagnostic
+data rather than matching error strings.
 
 The `graphql-query-macro` workspace crate provides
 `validate_given_graphql!(include_str!("query/file.graphql"))`. File paths are

@@ -1,7 +1,7 @@
-use anyhow::{Context, Result, bail};
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::Value;
 use std::time::Duration;
+use thiserror::Error;
 
 #[derive(Debug, Deserialize)]
 pub struct Response<T> {
@@ -10,7 +10,8 @@ pub struct Response<T> {
     pub errors: Vec<GraphqlError>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Error)]
+#[error("{message}")]
 pub struct GraphqlError {
     pub message: String,
     #[serde(default)]
@@ -28,6 +29,52 @@ impl GraphqlError {
                     .to_ascii_lowercase()
                     .contains("vulnerability alerts"))
     }
+}
+
+#[derive(Debug, Error)]
+pub enum ApiError {
+    #[error("could not run gh auth token; install GitHub CLI and run gh auth login: {0}")]
+    AuthCommand(#[source] std::io::Error),
+    #[error("gh auth token failed ({status}): {stderr}")]
+    AuthRejected {
+        status: std::process::ExitStatus,
+        stderr: String,
+    },
+    #[error("gh returned an invalid token: {0}")]
+    InvalidToken(#[source] std::string::FromUtf8Error),
+    #[error("GitHub request worker failed: {0}")]
+    Worker(#[source] tokio::task::JoinError),
+    #[error("GitHub GraphQL request failed: {0}")]
+    Transport(#[source] Box<ureq::Error>),
+    #[error("GitHub GraphQL HTTP {status}: {body}")]
+    Http { status: u16, body: String },
+    #[error("invalid GitHub GraphQL response: {0}")]
+    Decode(#[source] serde_json::Error),
+    #[error("GitHub GraphQL: {}", .0.iter().map(|e| e.message.as_str()).collect::<Vec<_>>().join("; "))]
+    Graphql(Vec<GraphqlError>),
+    #[error("GitHub returned no GraphQL data")]
+    MissingData,
+}
+
+type Result<T> = std::result::Result<T, ApiError>;
+
+impl<T> Response<T> {
+    pub fn into_data(self) -> Result<T> {
+        if !self.errors.is_empty() {
+            return Err(ApiError::Graphql(self.errors));
+        }
+        self.data.ok_or(ApiError::MissingData)
+    }
+}
+
+fn decode_response<T: DeserializeOwned>(status: u16, body: &str) -> Result<Response<T>> {
+    if !(200..300).contains(&status) {
+        return Err(ApiError::Http {
+            status,
+            body: body.chars().take(2000).collect(),
+        });
+    }
+    serde_json::from_str(body).map_err(ApiError::Decode)
 }
 
 pub struct Api {
@@ -61,14 +108,14 @@ impl Api {
             .args(["auth", "token", "--hostname", "github.com"])
             .output()
             .await
-            .context("could not run gh auth token; install GitHub CLI and run gh auth login")?;
+            .map_err(ApiError::AuthCommand)?;
         if !output.status.success() {
-            bail!(
-                "gh auth token failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
+            return Err(ApiError::AuthRejected {
+                status: output.status,
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            });
         }
-        let token = String::from_utf8(output.stdout).context("gh returned an invalid token")?;
+        let token = String::from_utf8(output.stdout).map_err(ApiError::InvalidToken)?;
         let authorization = format!("Bearer {}", token.trim());
         let agent = ureq::Agent::config_builder()
             .user_agent("gh-dependabot-repos")
@@ -100,12 +147,13 @@ impl Api {
                     .post("https://api.github.com/graphql")
                     .header("Authorization", &authorization)
                     .send_json(&payload)?;
-                let status = response.status().as_u16();
+                let status = response.status();
                 let body = response.body_mut().read_to_string()?;
-                Ok::<_, ureq::Error>((status, body))
+                Ok((status, body))
             })
             .await
-            .context("GitHub request worker failed")?;
+            .map_err(ApiError::Worker)?;
+
             let (status, body) = match result {
                 Ok(response) => response,
                 Err(error) if attempt < 3 && retryable_transport(&error) => {
@@ -113,41 +161,26 @@ impl Api {
                     backoff(attempt).await;
                     continue;
                 }
-                Err(error) => return Err(error).context("GitHub GraphQL request failed"),
+                Err(error) => return Err(ApiError::Transport(Box::new(error))),
             };
-            if retryable(status) && attempt < 3 {
+
+            if retryable(status.as_u16()) && attempt < 3 {
                 eprintln!(
-                    "warning: GitHub returned HTTP {status}; retry {}/3",
+                    "warning: GitHub returned HTTP {}; retry {}/3",
+                    status.as_u16(),
                     attempt + 1
                 );
                 backoff(attempt).await;
                 continue;
             }
-            if !(200..300).contains(&status) {
-                bail!(
-                    "GitHub GraphQL HTTP {status}: {}",
-                    body.chars().take(2000).collect::<String>()
-                );
-            }
-            return serde_json::from_str(&body).context("invalid GitHub GraphQL response");
+            return decode_response(status.as_u16(), &body);
         }
         unreachable!()
     }
 
     pub async fn strict<T: DeserializeOwned>(&self, query: &str, variables: Value) -> Result<T> {
         let response: Response<T> = self.query(query, variables).await?;
-        if !response.errors.is_empty() {
-            bail!(
-                "GitHub GraphQL: {}",
-                response
-                    .errors
-                    .iter()
-                    .map(|e| e.message.as_str())
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            );
-        }
-        response.data.context("GitHub returned no GraphQL data")
+        response.into_data()
     }
 }
 
@@ -158,6 +191,46 @@ async fn backoff(attempt: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn http_failures_preserve_status_and_diagnostic() {
+        let error = decode_response::<Value>(401, "bad credentials").unwrap_err();
+        assert!(matches!(error, ApiError::Http { status: 401, body } if body == "bad credentials"));
+        let error = decode_response::<Value>(504, &"x".repeat(3000)).unwrap_err();
+        assert!(matches!(error, ApiError::Http { status: 504, body } if body.len() == 2000));
+    }
+
+    #[test]
+    fn invalid_json_preserves_parse_error() {
+        let error = decode_response::<Value>(200, "not JSON").unwrap_err();
+        assert!(matches!(error, ApiError::Decode(source) if source.is_syntax()));
+    }
+
+    #[test]
+    fn strict_responses_keep_graphql_errors_and_reject_missing_data() {
+        let response = decode_response::<Value>(200,
+            r#"{"data":{"viewer":null},"errors":[{"type":"FORBIDDEN","message":"denied","path":["viewer"]}]}"#).unwrap();
+        let error = response.into_data().unwrap_err();
+        assert!(
+            matches!(error, ApiError::Graphql(errors) if errors.len() == 1
+            && errors[0].kind.as_deref() == Some("FORBIDDEN")
+            && errors[0].path == vec![serde_json::json!("viewer")])
+        );
+        assert!(matches!(
+            decode_response::<Value>(200, r#"{"data":null}"#)
+                .unwrap()
+                .into_data(),
+            Err(ApiError::MissingData)
+        ));
+    }
+
+    #[test]
+    fn errors_retain_sources_and_useful_diagnostics() {
+        use std::error::Error as _;
+        let error = ApiError::Transport(Box::new(ureq::Error::ConnectionFailed));
+        assert!(error.source().is_some());
+        assert!(error.to_string().contains("GitHub GraphQL request failed"));
+    }
+
     #[test]
     fn transport_retry_classification() {
         assert!(retryable_transport(&ureq::Error::ConnectionFailed));

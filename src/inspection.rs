@@ -1,12 +1,53 @@
 use crate::{
-    api::{Api, Response},
+    api::{Api, ApiError, GraphqlError, Response},
     discovery::Repository,
 };
-use anyhow::{Context, Result, bail};
 use futures::{StreamExt, TryStreamExt, stream};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum InspectionError {
+    #[error(transparent)]
+    Api(#[from] ApiError),
+    #[error("invalid repository name: {name}")]
+    InvalidRepositoryName { name: String },
+    #[error("could not serialize GraphQL query arguments: {0}")]
+    QuerySerialization(#[from] serde_json::Error),
+    #[error("GitHub GraphQL: {source}")]
+    GlobalGraphql { source: GraphqlError },
+    #[error("GitHub GraphQL for {repository}: {source}")]
+    RepositoryGraphql {
+        repository: String,
+        source: GraphqlError,
+    },
+    #[error("GitHub returned no batch data")]
+    MissingData,
+    #[error("GitHub batch response is missing alias {alias}")]
+    MissingAlias { alias: String },
+}
+
+type Result<T> = std::result::Result<T, InspectionError>;
+
+#[derive(Debug, Error)]
+pub enum SkipReason {
+    #[error("{0}")]
+    Graphql(#[source] GraphqlError),
+    #[error("vulnerability alerts unavailable")]
+    AlertsUnavailable,
+    #[error("repository no longer accessible")]
+    RepositoryUnavailable,
+}
+
+#[derive(Debug, Error)]
+#[error("skipping {repository}: {reason}")]
+pub struct SkippedRepository {
+    pub repository: String,
+    #[source]
+    pub reason: SkipReason,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -30,10 +71,11 @@ type BatchData = BTreeMap<String, Option<CheckedRepository>>;
 pub fn batch_query(repos: &[Repository]) -> Result<String> {
     let mut query = String::from("query {\n");
     for (i, repo) in repos.iter().enumerate() {
-        let (owner, name) = repo
-            .name_with_owner
-            .split_once('/')
-            .context("invalid repository name")?;
+        let (owner, name) = repo.name_with_owner.split_once('/').ok_or_else(|| {
+            InspectionError::InvalidRepositoryName {
+                name: repo.name_with_owner.clone(),
+            }
+        })?;
         // JSON string literals are also valid GraphQL string literals.
         query.push_str(&format!("r{i}: repository(owner: {}, name: {}) {{ nameWithOwner vulnerabilityAlerts(first: 1, states: OPEN) {{ totalCount }} }}\n",
             serde_json::to_string(owner)?, serde_json::to_string(name)?));
@@ -45,7 +87,7 @@ pub fn batch_query(repos: &[Repository]) -> Result<String> {
 pub fn interpret(
     response: Response<BatchData>,
     repos: &[Repository],
-) -> Result<(Vec<Match>, Vec<String>)> {
+) -> Result<(Vec<Match>, Vec<SkippedRepository>)> {
     let mut skipped = BTreeSet::new();
     let mut warnings = Vec::new();
     for error in response.errors {
@@ -55,22 +97,21 @@ pub fn interpret(
             .and_then(|i| i.parse::<usize>().ok());
         // Only explicitly repository-scoped permission/unavailable errors are safe to skip.
         let Some(index) = index.filter(|i| *i < repos.len()) else {
-            bail!("GitHub GraphQL: {}", error.message);
+            return Err(InspectionError::GlobalGraphql { source: error });
         };
         if !error.skippable() {
-            bail!(
-                "GitHub GraphQL for {}: {}",
-                repos[index].name_with_owner,
-                error.message
-            );
+            return Err(InspectionError::RepositoryGraphql {
+                repository: repos[index].name_with_owner.clone(),
+                source: error,
+            });
         }
         skipped.insert(index);
-        warnings.push(format!(
-            "skipping {}: {}",
-            repos[index].name_with_owner, error.message
-        ));
+        warnings.push(SkippedRepository {
+            repository: repos[index].name_with_owner.clone(),
+            reason: SkipReason::Graphql(error),
+        });
     }
-    let data = response.data.context("GitHub returned no batch data")?;
+    let data = response.data.ok_or(InspectionError::MissingData)?;
     let mut matches = Vec::new();
     for (i, repo) in repos.iter().enumerate() {
         if skipped.contains(&i) {
@@ -78,7 +119,9 @@ pub fn interpret(
         }
         let entry = data
             .get(&format!("r{i}"))
-            .context("GitHub batch response is missing an alias")?;
+            .ok_or_else(|| InspectionError::MissingAlias {
+                alias: format!("r{i}"),
+            })?;
         match entry {
             Some(checked) => match &checked.vulnerability_alerts {
                 Some(alerts) if alerts.total_count > 0 => matches.push(Match {
@@ -86,15 +129,15 @@ pub fn interpret(
                     open_alerts: alerts.total_count,
                 }),
                 Some(_) => {}
-                None => warnings.push(format!(
-                    "skipping {}: vulnerability alerts unavailable",
-                    repo.name_with_owner
-                )),
+                None => warnings.push(SkippedRepository {
+                    repository: repo.name_with_owner.clone(),
+                    reason: SkipReason::AlertsUnavailable,
+                }),
             },
-            None => warnings.push(format!(
-                "skipping {}: repository no longer accessible",
-                repo.name_with_owner
-            )),
+            None => warnings.push(SkippedRepository {
+                repository: repo.name_with_owner.clone(),
+                reason: SkipReason::RepositoryUnavailable,
+            }),
         }
     }
     Ok((matches, warnings))
@@ -113,7 +156,7 @@ pub async fn inspect(
         for warning in warnings {
             eprintln!("warning: {warning}");
         }
-        Ok::<_, anyhow::Error>(matches)
+        Ok::<_, InspectionError>(matches)
     }))
     .buffer_unordered(concurrency)
     .try_collect()
@@ -173,18 +216,63 @@ mod tests {
         }, "errors":[{"type":"FORBIDDEN","message":"denied","path":["r1","vulnerabilityAlerts"]}]})), &repos()).unwrap();
         assert_eq!(matches.len(), 1);
         assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].repository, "bar/b");
+        assert!(matches!(&warnings[0].reason, SkipReason::Graphql(error)
+            if error.kind.as_deref() == Some("FORBIDDEN") && error.message == "denied"));
     }
     #[test]
-    fn unexpected_and_global_errors_fail() {
-        for error in [
-            json!({"type":"INTERNAL","message":"oops","path":["r1"]}),
-            json!({"type":"FORBIDDEN","message":"bad token"}),
-            json!({"type":"RATE_LIMITED","message":"rate limit","path":["r0"]}),
-        ] {
-            assert!(interpret(parse(json!({"data":{},"errors":[error]})), &repos()).is_err());
+    fn unexpected_repository_errors_preserve_repository_and_cause() {
+        for (kind, alias, repository) in
+            [("INTERNAL", "r1", "bar/b"), ("RATE_LIMITED", "r0", "foo/a")]
+        {
+            let result = interpret(
+                parse(json!({"data":{},"errors":[{
+                    "type":kind,"message":"API failure","path":[alias,"vulnerabilityAlerts"]
+                }]})),
+                &repos(),
+            );
+            assert!(
+                matches!(result, Err(InspectionError::RepositoryGraphql { repository: actual, source })
+                if actual == repository && source.kind.as_deref() == Some(kind)
+                && source.message == "API failure")
+            );
         }
-        assert!(interpret(parse(json!({"data":{}})), &repos()).is_err());
     }
+
+    #[test]
+    fn global_errors_are_never_skipped() {
+        let result = interpret(
+            parse(json!({"data":{},"errors":[{
+                "type":"FORBIDDEN","message":"bad token"
+            }]})),
+            &repos(),
+        );
+        assert!(
+            matches!(result, Err(InspectionError::GlobalGraphql { source })
+            if source.message == "bad token" && source.kind.as_deref() == Some("FORBIDDEN"))
+        );
+    }
+
+    #[test]
+    fn missing_data_and_alias_are_distinct() {
+        assert!(matches!(
+            interpret(parse(json!({"data":null})), &repos()),
+            Err(InspectionError::MissingData)
+        ));
+        assert!(matches!(interpret(parse(json!({"data":{}})), &repos()),
+            Err(InspectionError::MissingAlias { alias }) if alias == "r0"));
+    }
+
+    #[test]
+    fn invalid_repository_name_is_typed() {
+        let result = batch_query(&[Repository {
+            name_with_owner: "invalid".into(),
+        }]);
+        assert!(
+            matches!(result, Err(InspectionError::InvalidRepositoryName { name }) if name == "invalid")
+        );
+    }
+
     #[test]
     fn unavailable_is_reported() {
         let (matches, warnings) = interpret(
@@ -196,5 +284,10 @@ mod tests {
         .unwrap();
         assert!(matches.is_empty());
         assert_eq!(warnings.len(), 2);
+        assert!(matches!(warnings[0].reason, SkipReason::AlertsUnavailable));
+        assert!(matches!(
+            warnings[1].reason,
+            SkipReason::RepositoryUnavailable
+        ));
     }
 }

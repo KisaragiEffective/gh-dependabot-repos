@@ -5,9 +5,23 @@ mod api;
 mod discovery;
 mod inspection;
 
-use anyhow::Result;
 use clap::Parser;
 use std::io::{self, Write};
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+enum AppError {
+    #[error(transparent)]
+    Api(#[from] api::ApiError),
+    #[error(transparent)]
+    Discovery(#[from] discovery::DiscoveryError),
+    #[error(transparent)]
+    Inspection(#[from] inspection::InspectionError),
+    #[error("could not serialize JSON output: {0}")]
+    JsonOutput(#[from] serde_json::Error),
+    #[error("could not write output: {0}")]
+    Output(#[from] io::Error),
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -28,7 +42,7 @@ struct Options {
     json: bool,
 }
 
-async fn run() -> Result<()> {
+async fn run() -> Result<(), AppError> {
     let options = Options::parse();
     let api = api::Api::authenticated().await?;
     let repositories = discovery::discover(&api, usize::from(options.concurrency)).await?;
@@ -57,7 +71,7 @@ async fn main() -> std::process::ExitCode {
     match run().await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("error: {error:#}");
+            eprintln!("error: {error}");
             std::process::ExitCode::FAILURE
         }
     }
