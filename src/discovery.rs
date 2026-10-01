@@ -1,6 +1,7 @@
 use crate::api::Api;
 use anyhow::{Context, Result, bail};
 use futures::{StreamExt, TryStreamExt, stream};
+use graphql_query_macro::validate_given_graphql;
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -48,9 +49,9 @@ struct Orgs {
     viewer: Memberships,
 }
 
-const USER_REPOS: &str = include_str!("../query/user_repos.graphql");
-const ORGS: &str = include_str!("../query/orgs.graphql");
-const ORG_REPOS: &str = include_str!("../query/org_repos.graphql");
+const USER_REPOS: &str = validate_given_graphql!(include_str!("query/user_repos.graphql"));
+const ORGS: &str = validate_given_graphql!(include_str!("query/orgs.graphql"));
+const ORG_REPOS: &str = validate_given_graphql!(include_str!("query/org_repos.graphql"));
 
 fn advance(page: PageInfo, previous: &Option<String>) -> Result<Option<String>> {
     if !page.has_next_page {

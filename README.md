@@ -1,6 +1,6 @@
 # gh-dependabot-repos
 
-A small async Rust GitHub CLI extension that prints sorted, unique `owner/repo`
+A small Rust GitHub CLI extension that prints sorted, unique `owner/repo`
 names with at least one open Dependabot vulnerability alert. Targets **github.com**.
 
 ## Local installation
@@ -77,7 +77,17 @@ personal repositories owned by other users are excluded.
 Repositories are deduplicated before inspection. Separate alias batches request
 only `vulnerabilityAlerts(first: 1, states: OPEN) { totalCount }`, never alert
 objects. Inspection also uses bounded concurrency. Discovery/API/inspection/output
-live in separate small modules; alias responses use a map of typed values.
+live in separate small modules; alias responses use a map of typed values. Clap derive handles CLI parsing. The
+HTTP client is `ureq`; its blocking request and response I/O runs on Tokio's
+blocking pool, with the same bounded request concurrency and async retry delays.
+
+The `graphql-query-macro` workspace crate provides
+`validate_given_graphql!(include_str!("query/file.graphql"))`. File paths are
+relative to the calling crate's `Cargo.toml`. It uses
+`graphql_parser::parse_query` at compile time and emits `include_str!` so Cargo
+tracks changes to query files. All three discovery queries use this macro.
+Validation checks GraphQL syntax, not compatibility with GitHub's live schema;
+inspection batches are assembled dynamically.
 
 Schema references: [User](https://docs.github.com/en/graphql/reference/users),
 [Organization](https://docs.github.com/en/graphql/reference/orgs),
@@ -85,12 +95,12 @@ Schema references: [User](https://docs.github.com/en/graphql/reference/users),
 [pagination](https://docs.github.com/en/graphql/guides/using-pagination-in-the-graphql-api).
 
 ```sh
-cargo fmt --check
-cargo test
-cargo clippy --all-targets -- -D warnings
+cargo fmt --all --check
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 Tests use fixtures and require no GitHub credentials or network access. They cover
 repository deduplication, pagination progress, alias escaping, counts and filtering,
 partial permission errors, unavailable fields, fatal errors, retry classification,
-and CLI bounds.
+CLI bounds, and proc-macro syntax validation (including compile-fail examples).

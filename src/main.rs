@@ -5,63 +5,40 @@ mod api;
 mod discovery;
 mod inspection;
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
+use clap::Parser;
 use std::io::{self, Write};
 
-#[derive(Debug)]
+#[derive(Debug, Parser)]
+#[command(
+    name = "gh-dependabot-repos",
+    bin_name = "gh dependabot-repos",
+    version,
+    about = "List accessible owned and member-organization repositories with open Dependabot alerts"
+)]
 struct Options {
-    batch_size: usize,
-    concurrency: usize,
+    /// Repository checks per request (1–100)
+    #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u16).range(1..=100))]
+    batch_size: u16,
+    /// Maximum simultaneous requests (1–32)
+    #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u16).range(1..=32))]
+    concurrency: u16,
+    /// Emit a JSON array with repository names and open alert counts
+    #[arg(long)]
     json: bool,
-}
-impl Options {
-    fn parse(args: impl IntoIterator<Item = String>) -> Result<Option<Self>> {
-        let mut options = Self {
-            batch_size: 20,
-            concurrency: 4,
-            json: false,
-        };
-        let mut args = args.into_iter();
-        while let Some(arg) = args.next() {
-            match arg.as_str() {
-                "--batch-size" | "--concurrency" => {
-                    let value: usize = args
-                        .next()
-                        .with_context(|| format!("{arg} requires a value"))?
-                        .parse()
-                        .with_context(|| format!("{arg} requires a positive integer"))?;
-                    let max = if arg == "--batch-size" { 100 } else { 32 };
-                    if value == 0 || value > max {
-                        bail!("{arg} must be between 1 and {max}");
-                    }
-                    if arg == "--batch-size" {
-                        options.batch_size = value;
-                    } else {
-                        options.concurrency = value;
-                    }
-                }
-                "--json" => options.json = true,
-                "--help" | "-h" => {
-                    println!(
-                        "Usage: gh dependabot-repos [--batch-size N] [--concurrency N] [--json]\n\nList accessible owned and member-organization repositories with open Dependabot alerts.\nDefaults: batch size 20 (1–100), concurrency 4 (1–32). JSON emits an array."
-                    );
-                    return Ok(None);
-                }
-                _ => bail!("unknown argument {arg}; use --help"),
-            }
-        }
-        Ok(Some(options))
-    }
 }
 
 async fn run() -> Result<()> {
-    let Some(options) = Options::parse(std::env::args().skip(1))? else {
-        return Ok(());
-    };
+    let options = Options::parse();
     let api = api::Api::authenticated().await?;
-    let repositories = discovery::discover(&api, options.concurrency).await?;
-    let matches =
-        inspection::inspect(&api, &repositories, options.batch_size, options.concurrency).await?;
+    let repositories = discovery::discover(&api, usize::from(options.concurrency)).await?;
+    let matches = inspection::inspect(
+        &api,
+        &repositories,
+        usize::from(options.batch_size),
+        usize::from(options.concurrency),
+    )
+    .await?;
     let mut stdout = io::BufWriter::new(io::stdout().lock());
     if options.json {
         serde_json::to_writer(&mut stdout, &matches)?;
@@ -90,6 +67,19 @@ async fn main() -> std::process::ExitCode {
 mod tests {
     use super::*;
     #[test]
+    fn cli_definition_and_defaults() {
+        use clap::CommandFactory;
+        Options::command().debug_assert();
+        let options = Options::try_parse_from(["gh-dependabot-repos"]).unwrap();
+        assert_eq!(options.batch_size, 20);
+        assert_eq!(options.concurrency, 4);
+        assert!(!options.json);
+        for flag in ["--help", "--version"] {
+            let error = Options::try_parse_from(["gh-dependabot-repos", flag]).unwrap_err();
+            assert_eq!(error.exit_code(), 0);
+        }
+    }
+    #[test]
     fn options_are_bounded() {
         for args in [
             vec!["--batch-size", "0"],
@@ -98,12 +88,19 @@ mod tests {
             vec!["--batch-size"],
             vec!["--bad"],
         ] {
-            assert!(Options::parse(args.into_iter().map(String::from)).is_err());
+            assert!(
+                Options::try_parse_from(std::iter::once("gh-dependabot-repos").chain(args))
+                    .is_err()
+            );
         }
-        let options = Options::parse(
-            ["--json", "--batch-size", "10", "--concurrency", "2"].map(String::from),
-        )
-        .unwrap()
+        let options = Options::try_parse_from([
+            "gh-dependabot-repos",
+            "--json",
+            "--batch-size",
+            "10",
+            "--concurrency",
+            "2",
+        ])
         .unwrap();
         assert!(options.json);
         assert_eq!(options.batch_size, 10);

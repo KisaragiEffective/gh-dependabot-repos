@@ -1,0 +1,8 @@
+query($cursor: String) {
+  viewer {
+    repositories(first: 100, after: $cursor, ownerAffiliations: [OWNER]) {
+      nodes { nameWithOwner }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}
