@@ -48,9 +48,9 @@ struct Orgs {
     viewer: Memberships,
 }
 
-const USER_REPOS: &str = "query($cursor:String) { viewer { repositories(first:100, after:$cursor, ownerAffiliations:[OWNER]) { nodes { nameWithOwner } pageInfo { hasNextPage endCursor } } } }";
-const ORGS: &str = "query($cursor:String) { viewer { organizations(first:100, after:$cursor) { nodes { login } pageInfo { hasNextPage endCursor } } } }";
-const ORG_REPOS: &str = "query($login:String!, $cursor:String) { organization(login:$login) { repositories(first:100, after:$cursor, ownerAffiliations:[OWNER]) { nodes { nameWithOwner } pageInfo { hasNextPage endCursor } } } }";
+const USER_REPOS: &str = include_str!("../query/user_repos.graphql");
+const ORGS: &str = include_str!("../query/orgs.graphql");
+const ORG_REPOS: &str = include_str!("../query/org_repos.graphql");
 
 fn advance(page: PageInfo, previous: &Option<String>) -> Result<Option<String>> {
     if !page.has_next_page {

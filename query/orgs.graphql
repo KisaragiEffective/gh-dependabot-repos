@@ -1,0 +1,1 @@
+query($cursor:String) { viewer { organizations(first:100, after:$cursor) { nodes { login } pageInfo { hasNextPage endCursor } } } }

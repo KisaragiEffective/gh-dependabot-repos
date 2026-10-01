@@ -1,0 +1,1 @@
+query($login:String!, $cursor:String) { organization(login:$login) { repositories(first:100, after:$cursor, ownerAffiliations:[OWNER]) { nodes { nameWithOwner } pageInfo { hasNextPage endCursor } } } }
