@@ -10,4 +10,4 @@ proc-macro = true
 graphql-parser = "0.4"
 proc-macro2 = "1"
 quote = "1"
-syn = "2"
+syn = "3"
